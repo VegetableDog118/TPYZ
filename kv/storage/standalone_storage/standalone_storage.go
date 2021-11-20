@@ -2,92 +2,79 @@ package standalone_storage
 
 import (
 	"github.com/Connor1996/badger"
-	"path/filepath"
-
 	"github.com/pingcap-incubator/tinykv/kv/config"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
+	"path/filepath"
 )
 
 // StandAloneStorage is an implementation of `Storage` for a single-node TinyKV instance. It does not
 // communicate with other nodes and all data is stored locally.
 type StandAloneStorage struct {
 	// Your Data Here (1).
-	engine *engine_util.Engines
-	config *config.Config
+	engines *engine_util.Engines
+	config  *config.Config
+}
+
+type StandAloneStorageReader struct {
+	txn *badger.Txn
+}
+
+func (standAloneStorageReader StandAloneStorageReader) GetCF(cf string, key []byte) ([]byte, error) {
+	val, err := engine_util.GetCFFromTxn(standAloneStorageReader.txn, cf, key)
+	if err != nil && err != badger.ErrKeyNotFound {
+		return nil, err
+	}
+	return val, nil
+}
+
+func (standAloneStorageReader StandAloneStorageReader) IterCF(cf string) engine_util.DBIterator {
+	return engine_util.NewCFIterator(cf, standAloneStorageReader.txn)
+}
+
+func (standAloneStorageReader StandAloneStorageReader) Close() {
+	standAloneStorageReader.txn.Discard()
 }
 
 func NewStandAloneStorage(conf *config.Config) *StandAloneStorage {
 	// Your Code Here (1).
-	dbPath := conf.DBPath
-	kvPath := filepath.Join(dbPath, "kv")
-	raftPath := filepath.Join(dbPath, "raft")
-
-	//os.MkdirAll(kvPath, os.ModePerm)
-	//os.MkdirAll(raftPath, os.ModePerm)
-
-	kvDB := engine_util.CreateDB("kv", false)
-	raftDB := engine_util.CreateDB("raft", true)
-	return &StandAloneStorage{
-		engine: engine_util.NewEngines(kvDB, raftDB, kvPath, raftPath),
-		config: conf,
-	}
+	return &StandAloneStorage{config: conf}
 }
 
 func (s *StandAloneStorage) Start() error {
 	// Your Code Here (1).
-	// nothing to start
+	path := s.config.DBPath
+	kvPath := filepath.Join(path, "kv")
+	raftPath := filepath.Join(path, "raft")
+	kvDb := engine_util.CreateDB(kvPath, false)
+	raftDb := engine_util.CreateDB(raftPath, true)
+	s.engines = engine_util.NewEngines(kvDb, raftDb, kvPath, raftPath)
 	return nil
 }
 
 func (s *StandAloneStorage) Stop() error {
 	// Your Code Here (1).
-	return s.engine.Close()
+	s.engines.Close()
+	return nil
 }
 
 func (s *StandAloneStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader, error) {
 	// Your Code Here (1).
-	// After implementing the standalone reader, we should start a new transaction in order to create the reader
-	// for read operation, no need for updating, set the "update" false
-	kvTxn := s.engine.Kv.NewTransaction(false)
-	reader := storage.NewStandAloneReader(kvTxn)
-	return reader, nil
+	return &StandAloneStorageReader{txn: s.engines.Kv.NewTransaction(false)}, nil
 }
 
 func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) error {
 	// Your Code Here (1).
-	// assert the type of batch, then do the relevant work: put and delete
-	// work can be implemented by the functions in util/engine_util/util, in this case, use PutCF and DeleteCF
-	/*for _, batch := range batch {
-		switch batch.Data.(type) {
-		case storage.Put:
-			put := batch.Data.(storage.Put)
-			engine_util.PutCF(s.engine.Kv, put.Cf, put.Key, put.Value)
-		case storage.Delete:
-			delete := batch.Data.(storage.Delete)
-			engine_util.DeleteCF(s.engine.Kv, delete.Cf, delete.Key)
+	writeBatchs := engine_util.WriteBatch{}
+	for _, v := range batch {
+		if v.Value() != nil {
+			//set
+			writeBatchs.SetCF(v.Cf(), v.Key(), v.Value())
+		} else {
+			//delete
+			writeBatchs.DeleteCF(v.Cf(), v.Key())
 		}
 	}
-	return nil*/
-	wb := new(engine_util.WriteBatch)
-	for _, m := range batch {
-		switch m.Data.(type) {
-		case storage.Put:
-			put := m.Data.(storage.Put)
-			//log.Printf("write put: %v, detail: cf=%v, key=%v, val=%v", put, put.Cf, put.Key, put.Value)
-			wb.SetCF(put.Cf, put.Key, put.Value)
-		case storage.Delete:
-			delete := m.Data.(storage.Delete)
-			wb.DeleteCF(delete.Cf, delete.Key)
-		}
-	}
-	err := wb.WriteToDB(s.engine.Kv)
-	if err != nil {
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return writeBatchs.WriteToDB(s.engines.Kv)
 }
